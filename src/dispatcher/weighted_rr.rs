@@ -13,7 +13,7 @@ use network_interface::NetworkInterfaceConfig;
 use tokio::sync::Mutex;
 use tracing::instrument;
 
-use crate::net::get_valid_addresses;
+use crate::net::{can_reach_internet, get_valid_addresses, is_virtual_or_vpn};
 
 use super::Dispatch;
 
@@ -163,6 +163,98 @@ impl WeightedAddress {
         }
 
         Ok(resolved)
+    }
+
+    pub async fn auto_discover() -> Result<Vec<WeightedAddress>> {
+        let interfaces = network_interface::NetworkInterface::show()?;
+        let mut candidates = Vec::new();
+
+        for net_interface in interfaces {
+            if is_virtual_or_vpn(&net_interface.name) {
+                continue;
+            }
+
+            let valid_addrs = get_valid_addresses(&net_interface.addr);
+            let mut ipv4_addrs = Vec::new();
+            let mut ipv6_addrs = Vec::new();
+
+            for addr in valid_addrs {
+                match addr {
+                    IpAddr::V4(v4) => ipv4_addrs.push(v4),
+                    IpAddr::V6(v6) => ipv6_addrs.push(v6),
+                }
+            }
+
+            if !ipv4_addrs.is_empty() || !ipv6_addrs.is_empty() {
+                candidates.push((net_interface.name, ipv4_addrs, ipv6_addrs));
+            }
+        }
+
+        if candidates.is_empty() {
+            return Err(eyre::eyre!(
+                "No usable physical network interfaces found. Run `dispatch list` to inspect available interfaces."
+            ));
+        }
+
+        let mut handles = Vec::new();
+        for (name, ipv4_addrs, ipv6_addrs) in candidates {
+            handles.push(tokio::spawn(async move {
+                let mut online_v4 = None;
+                for v4 in &ipv4_addrs {
+                    if can_reach_internet(IpAddr::V4(*v4)).await {
+                        online_v4 = Some(*v4);
+                        break;
+                    }
+                }
+
+                let mut online_v6 = None;
+                for v6 in &ipv6_addrs {
+                    if can_reach_internet(IpAddr::V6(*v6)).await {
+                        online_v6 = Some(*v6);
+                        break;
+                    }
+                }
+
+                (name, ipv4_addrs, ipv6_addrs, online_v4, online_v6)
+            }));
+        }
+
+        let mut online = Vec::new();
+        let mut fallback = Vec::new();
+
+        for handle in handles {
+            if let Ok((name, ipv4_addrs, ipv6_addrs, online_v4, online_v6)) = handle.await {
+                if online_v4.is_some() || online_v6.is_some() {
+                    online.push(WeightedAddress {
+                        interface: Interface::Named {
+                            name: name.clone(),
+                            ipv4: online_v4,
+                            ipv6: online_v6,
+                        },
+                        weight: NonZeroUsize::new(1).unwrap(),
+                    });
+                }
+                fallback.push(WeightedAddress {
+                    interface: Interface::Named {
+                        name,
+                        ipv4: ipv4_addrs.into_iter().next(),
+                        ipv6: ipv6_addrs.into_iter().next(),
+                    },
+                    weight: NonZeroUsize::new(1).unwrap(),
+                });
+            }
+        }
+
+        if !online.is_empty() {
+            Ok(online)
+        } else if !fallback.is_empty() {
+            println!("Warning: No candidate interfaces reached the internet. Falling back to detected physical interfaces.");
+            Ok(fallback)
+        } else {
+            Err(eyre::eyre!(
+                "No usable network interfaces found. Run `dispatch list` to inspect available interfaces."
+            ))
+        }
     }
 }
 

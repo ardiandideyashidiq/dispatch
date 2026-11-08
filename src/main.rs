@@ -2,7 +2,7 @@ use std::{net::IpAddr, str::FromStr};
 
 use clap::Parser;
 use debug::LogStrategy;
-use dispatcher::{RawWeightedAddress, WeightedAddress};
+use dispatcher::RawWeightedAddress;
 use eyre::Result;
 
 mod debug;
@@ -35,8 +35,9 @@ enum Command {
         /// Which port to listen to for connections
         #[arg(default_value = "1080", long)]
         port: u16,
-        /// The network interface IP addresses to dispatch to, in the form of <address>[/priority]
-        #[arg(required = true, value_parser = RawWeightedAddress::from_str)]
+        /// The network interface IP addresses to dispatch to, in the form of <address>[/priority].
+        /// If omitted, automatically discovers usable internet interfaces.
+        #[arg(value_parser = RawWeightedAddress::from_str)]
         addresses: Vec<RawWeightedAddress>,
     },
 }
@@ -57,7 +58,6 @@ fn main() -> Result<()> {
             port,
             addresses,
         } => {
-            let addresses = WeightedAddress::resolve(addresses)?;
             server::server(ip, port, addresses)?
         }
     }

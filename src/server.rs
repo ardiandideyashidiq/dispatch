@@ -12,7 +12,9 @@ use tokio::{
 use tracing::instrument;
 
 use crate::{
-    dispatcher::{Dispatch, WeightedAddress, WeightedRoundRobinDispatcher},
+    dispatcher::{
+        Dispatch, RawWeightedAddress, WeightedAddress, WeightedRoundRobinDispatcher,
+    },
     socks::SocksHandshake,
 };
 
@@ -109,8 +111,29 @@ where
 }
 
 #[instrument]
-async fn start_server(addr: SocketAddr, addresses: Vec<WeightedAddress>) -> Result<()> {
+async fn start_server(
+    addr: SocketAddr,
+    addresses: Vec<WeightedAddress>,
+    auto_discovered: bool,
+) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
+
+    if auto_discovered {
+        println!(
+            "Auto-discovered {} usable {}: {}",
+            addresses.len(),
+            if addresses.len() > 1 {
+                "interfaces"
+            } else {
+                "interface"
+            },
+            addresses
+                .iter()
+                .map(|addr| format!("{}", addr.bold()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     println!("SOCKS proxy started on {}", addr.bold());
     println!(
@@ -143,8 +166,16 @@ async fn start_server(addr: SocketAddr, addresses: Vec<WeightedAddress>) -> Resu
 }
 
 #[instrument]
-pub fn server(ip: IpAddr, port: u16, addresses: Vec<WeightedAddress>) -> Result<()> {
+pub fn server(ip: IpAddr, port: u16, addresses: Vec<RawWeightedAddress>) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
 
-    rt.block_on(start_server(SocketAddr::new(ip, port), addresses))
+    rt.block_on(async {
+        let (resolved, auto_discovered) = if addresses.is_empty() {
+            (WeightedAddress::auto_discover().await?, true)
+        } else {
+            (WeightedAddress::resolve(addresses)?, false)
+        };
+
+        start_server(SocketAddr::new(ip, port), resolved, auto_discovered).await
+    })
 }
