@@ -94,7 +94,7 @@ impl WeightedAddress {
                 let mut ipv4_addrs = vec![];
                 let mut ipv6_addrs = vec![];
 
-                let addresses = get_valid_addresses(&net_interface.addr);
+                let addresses = get_valid_addresses(&net_interface.addr, Some(&net_interface.name));
 
                 for addr in addresses {
                     match addr {
@@ -155,11 +155,31 @@ impl WeightedAddress {
                     interface.as_str()
                 )
             })?;
+            let owning_interface = interfaces
+                .iter()
+                .find(|iface| iface.addr.iter().any(|a| a.ip() == ip));
 
-            resolved.push(WeightedAddress {
-                interface: Interface::Ip(ip),
-                weight,
-            });
+            if let Some(net_interface) = owning_interface {
+                resolved.push(WeightedAddress {
+                    interface: Interface::Named {
+                        name: net_interface.name.clone(),
+                        ipv4: match ip {
+                            IpAddr::V4(v4) => Some(v4),
+                            _ => None,
+                        },
+                        ipv6: match ip {
+                            IpAddr::V6(v6) => Some(v6),
+                            _ => None,
+                        },
+                    },
+                    weight,
+                });
+            } else {
+                resolved.push(WeightedAddress {
+                    interface: Interface::Ip(ip),
+                    weight,
+                });
+            }
         }
 
         Ok(resolved)
@@ -174,7 +194,7 @@ impl WeightedAddress {
                 continue;
             }
 
-            let valid_addrs = get_valid_addresses(&net_interface.addr);
+            let valid_addrs = get_valid_addresses(&net_interface.addr, Some(&net_interface.name));
             let mut ipv4_addrs = Vec::new();
             let mut ipv6_addrs = Vec::new();
 
@@ -201,7 +221,7 @@ impl WeightedAddress {
             handles.push(tokio::spawn(async move {
                 let mut online_v4 = None;
                 for v4 in &ipv4_addrs {
-                    if can_reach_internet(IpAddr::V4(*v4)).await {
+                    if can_reach_internet(IpAddr::V4(*v4), Some(&name)).await {
                         online_v4 = Some(*v4);
                         break;
                     }
@@ -209,7 +229,7 @@ impl WeightedAddress {
 
                 let mut online_v6 = None;
                 for v6 in &ipv6_addrs {
-                    if can_reach_internet(IpAddr::V6(*v6)).await {
+                    if can_reach_internet(IpAddr::V6(*v6), Some(&name)).await {
                         online_v6 = Some(*v6);
                         break;
                     }
@@ -278,10 +298,17 @@ impl Display for WeightedAddress {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetAddress {
+    pub ip: IpAddr,
+    pub interface: Option<String>,
+}
+
 #[derive(Clone, Debug)]
-pub struct WeightedIp {
-    ip: IpAddr,
-    weight: NonZeroUsize,
+pub struct WeightedTarget {
+    pub ip: IpAddr,
+    pub interface: Option<String>,
+    pub weight: NonZeroUsize,
 }
 
 #[derive(Debug)]
@@ -292,7 +319,7 @@ struct WeightedRoundRobinDispatcherInner {
 
 #[derive(Debug)]
 struct State {
-    ips: Vec<WeightedIp>,
+    ips: Vec<WeightedTarget>,
     ip_idx: usize,
     count: usize,
 }
@@ -309,27 +336,31 @@ impl WeightedRoundRobinDispatcherInner {
 
         for address in addresses {
             match address.interface {
-                Interface::Named { ipv4, ipv6, .. } => {
+                Interface::Named { name, ipv4, ipv6 } => {
                     if let Some(ipv4) = ipv4 {
-                        ipv4s.push(WeightedIp {
+                        ipv4s.push(WeightedTarget {
                             ip: IpAddr::V4(ipv4),
+                            interface: Some(name.clone()),
                             weight: address.weight,
                         });
                     }
                     if let Some(ipv6) = ipv6 {
-                        ipv6s.push(WeightedIp {
+                        ipv6s.push(WeightedTarget {
                             ip: IpAddr::V6(ipv6),
+                            interface: Some(name.clone()),
                             weight: address.weight,
                         });
                     }
                 }
                 Interface::Ip(ip) => match ip {
-                    IpAddr::V4(v4) => ipv4s.push(WeightedIp {
+                    IpAddr::V4(v4) => ipv4s.push(WeightedTarget {
                         ip: IpAddr::V4(v4),
+                        interface: None,
                         weight: address.weight,
                     }),
-                    IpAddr::V6(v6) => ipv6s.push(WeightedIp {
+                    IpAddr::V6(v6) => ipv6s.push(WeightedTarget {
                         ip: IpAddr::V6(v6),
+                        interface: None,
                         weight: address.weight,
                     }),
                 },
@@ -350,7 +381,7 @@ impl WeightedRoundRobinDispatcherInner {
         }
     }
 
-    fn dispatch(&mut self, remote_addr: &SocketAddr) -> Result<IpAddr> {
+    fn dispatch(&mut self, remote_addr: &SocketAddr) -> Result<TargetAddress> {
         let state = self.select_state(remote_addr)?;
 
         let ip = &state.ips[state.ip_idx];
@@ -361,7 +392,10 @@ impl WeightedRoundRobinDispatcherInner {
             state.ip_idx = (state.ip_idx + 1) % state.ips.len();
         }
 
-        Ok(ip.ip)
+        Ok(TargetAddress {
+            ip: ip.ip,
+            interface: ip.interface.clone(),
+        })
     }
 
     fn select_state(&mut self, remote_addr: &SocketAddr) -> Result<&mut State> {
@@ -406,7 +440,7 @@ impl WeightedRoundRobinDispatcher {
 #[async_trait::async_trait]
 impl Dispatch for WeightedRoundRobinDispatcher {
     #[instrument]
-    async fn dispatch(&self, remote_addr: &SocketAddr) -> Result<IpAddr> {
+    async fn dispatch(&self, remote_addr: &SocketAddr) -> Result<TargetAddress> {
         let mut dispatcher = self.0.lock().await;
         dispatcher.dispatch(remote_addr)
     }

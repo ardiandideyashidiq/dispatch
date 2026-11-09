@@ -16,7 +16,10 @@ use tokio::{
 };
 use tracing::instrument;
 
-use crate::{dispatcher::Dispatch, net::bind_socket};
+use crate::{
+    dispatcher::{Dispatch, TargetAddress},
+    net::bind_socket,
+};
 
 const HTTP_METHODS: [&str; 9] = [
     "GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH",
@@ -35,10 +38,10 @@ fn assert_supports_noauth(handshake: &SocksV5Handshake) -> Result<()> {
 }
 
 #[instrument]
-fn try_bind_socket(addr: IpAddr) -> Result<TcpSocket> {
-    bind_socket(addr).map_err(|err| match err.raw_os_error() {
+fn try_bind_socket(target: &TargetAddress) -> Result<TcpSocket> {
+    bind_socket(target.ip, target.interface.as_deref()).map_err(|err| match err.raw_os_error() {
         // Can't assign requested address
-        Some(49) => eyre::eyre!(err).wrap_err(unaccessible_local_address_error(&addr)),
+        Some(49) => eyre::eyre!(err).wrap_err(unaccessible_local_address_error(&target.ip)),
         _ => eyre::eyre!(err),
     })
 }
@@ -127,24 +130,24 @@ where
 
                 let host = self.handle_request_v5().await?;
 
-                let local_addr = self
+                let target = self
                     .dispatcher
                     .dispatch(&host)
                     .await
                     .wrap_err_with(dispatch_error)?;
 
-                self.handle_connect_v5(host, local_addr).await
+                self.handle_connect_v5(host, target).await
             }
             socksv5::SocksVersion::V4 => {
                 let host = self.handle_request_v4().await?;
 
-                let local_addr = self
+                let target = self
                     .dispatcher
                     .dispatch(&host)
                     .await
                     .wrap_err_with(dispatch_error)?;
 
-                self.handle_connect_v4(host, local_addr).await
+                self.handle_connect_v4(host, target).await
             }
         }
     }
@@ -211,9 +214,9 @@ where
     async fn handle_connect_v5(
         &mut self,
         address: SocketAddr,
-        local_addr: IpAddr,
+        target: TargetAddress,
     ) -> Result<TcpStream> {
-        let server_socket = try_bind_socket(local_addr)?;
+        let server_socket = try_bind_socket(&target)?;
 
         let server_stream = server_socket.connect(address).await;
 
@@ -299,9 +302,9 @@ where
     async fn handle_connect_v4(
         &mut self,
         address: SocketAddr,
-        local_addr: IpAddr,
+        target: TargetAddress,
     ) -> Result<TcpStream> {
-        let server_socket = try_bind_socket(local_addr)?;
+        let server_socket = try_bind_socket(&target)?;
 
         let server_stream = server_socket.connect(address).await;
 

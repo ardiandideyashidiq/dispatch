@@ -8,24 +8,56 @@ use tokio::net::TcpSocket;
 use tracing::instrument;
 
 #[instrument]
-pub fn bind_socket(addr: IpAddr) -> std::io::Result<TcpSocket> {
+pub fn bind_socket(addr: IpAddr, interface: Option<&str>) -> std::io::Result<TcpSocket> {
     let socket = match addr {
         IpAddr::V4(_) => TcpSocket::new_v4()?,
         IpAddr::V6(_) => TcpSocket::new_v6()?,
     };
 
     socket.set_reuseaddr(true)?;
+
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    if let Some(iface) = interface {
+        if let Err(err) = socket.bind_device(Some(iface.as_bytes())) {
+            tracing::warn!("Failed to bind socket to device `{}`: {}", iface, err);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    if let Some(iface) = interface {
+        use std::os::fd::AsRawFd;
+        if let Ok(c_str) = std::ffi::CString::new(iface) {
+            let if_index = unsafe { libc::if_nametoindex(c_str.as_ptr()) };
+            if if_index != 0 {
+                let fd = socket.as_raw_fd();
+                unsafe {
+                    let (level, opt) = match addr {
+                        IpAddr::V4(_) => (libc::IPPROTO_IP, libc::IP_BOUND_IF),
+                        IpAddr::V6(_) => (libc::IPPROTO_IPV6, libc::IPV6_BOUND_IF),
+                    };
+                    libc::setsockopt(
+                        fd,
+                        level,
+                        opt,
+                        &if_index as *const _ as *const libc::c_void,
+                        std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+                    );
+                }
+            }
+        }
+    }
+
     socket.bind((addr, 0).into())?;
 
     Ok(socket)
 }
 
-pub fn get_valid_addresses(addresses: &[Addr]) -> Vec<IpAddr> {
+pub fn get_valid_addresses(addresses: &[Addr], interface: Option<&str>) -> Vec<IpAddr> {
     addresses
         .iter()
         .map(|addr| addr.ip())
         .filter(|addr| !is_local_address(addr))
-        .filter(|addr| bind_socket(*addr).is_ok())
+        .filter(|addr| bind_socket(*addr, interface).is_ok())
         .collect()
 }
 
@@ -74,7 +106,7 @@ pub fn is_virtual_or_vpn(name: &str) -> bool {
         || lower.starts_with("zt")
 }
 
-pub async fn can_reach_internet(addr: IpAddr) -> bool {
+pub async fn can_reach_internet(addr: IpAddr, interface: Option<&str>) -> bool {
     let targets: &[(IpAddr, u16)] = match addr {
         IpAddr::V4(_) => &[
             (IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1)), 80),
@@ -97,7 +129,7 @@ pub async fn can_reach_internet(addr: IpAddr) -> bool {
     };
 
     for &(target_ip, port) in targets {
-        if let Ok(socket) = bind_socket(addr) {
+        if let Ok(socket) = bind_socket(addr, interface) {
             let connect_fut = socket.connect(SocketAddr::new(target_ip, port));
             if tokio::time::timeout(Duration::from_millis(800), connect_fut)
                 .await
@@ -133,5 +165,12 @@ mod tests {
         assert!(!is_virtual_or_vpn("eth0"));
         assert!(!is_virtual_or_vpn("wlan0"));
         assert!(!is_virtual_or_vpn("en0"));
+    }
+
+    #[test]
+    fn test_bind_socket_device() {
+        let loopback = IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
+        assert!(bind_socket(loopback, None).is_ok());
+        assert!(bind_socket(loopback, Some("lo")).is_ok());
     }
 }

@@ -18,7 +18,7 @@ pub fn list() {
         .filter(|interface| !interface.addr.is_empty())
     {
         let addrs = {
-            let mut addrs = get_valid_addresses(&interface.addr);
+            let mut addrs = get_valid_addresses(&interface.addr, Some(&interface.name));
             addrs.sort_by_key(|addr| addr.is_ipv6());
             addrs
         };
