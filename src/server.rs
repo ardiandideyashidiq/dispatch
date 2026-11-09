@@ -5,10 +5,7 @@ use std::{
 
 use color_eyre::owo_colors::OwoColorize;
 use eyre::Result;
-use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    net::{TcpListener, TcpStream},
-};
+use tokio::net::{TcpListener, TcpStream};
 use tracing::instrument;
 
 use crate::{
@@ -54,11 +51,23 @@ where
         remote_addr
     );
 
-    let (client_reader, client_writer) = socket.split();
-    let (server_reader, server_writer) = server_socket.split();
-
-    // TODO: we can get a connection reset by peer here.
-    pipe_multiple(client_reader, client_writer, server_reader, server_writer).await?;
+    if let Err(err) = tokio::io::copy_bidirectional_with_sizes(
+        &mut socket,
+        &mut server_socket,
+        65536,
+        65536,
+    )
+    .await
+    {
+        if err.kind() != std::io::ErrorKind::ConnectionReset {
+            tracing::warn!(
+                "connection error between {} and {}: {}",
+                local_addr,
+                remote_addr,
+                err
+            );
+        }
+    }
 
     tracing::info!(
         "connection terminated between {} and {}",
@@ -67,47 +76,6 @@ where
     );
 
     Ok(())
-}
-
-async fn pipe<R, W>(mut reader: R, mut writer: W) -> Result<()>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    if let Err(err) = tokio::io::copy(&mut reader, &mut writer).await {
-        match err.raw_os_error() {
-            // Connection reset by peer (os error 54)
-            // TODO: we currently don't have a way to propagate this error in either direction, so instead we act as if
-            // the stream ended gracefully (EOF).
-            Some(54) => Ok(()),
-            _ => Err(eyre::eyre!(err)),
-        }
-    } else {
-        Ok(())
-    }
-}
-
-async fn pipe_multiple<R1, W1, R2, W2>(
-    reader1: R1,
-    writer1: W1,
-    reader2: R2,
-    writer2: W2,
-) -> Result<()>
-where
-    R1: AsyncRead + Unpin,
-    W1: AsyncWrite + Unpin,
-    R2: AsyncRead + Unpin,
-    W2: AsyncWrite + Unpin,
-{
-    let pipe1 = pipe(reader1, writer2);
-    let pipe2 = pipe(reader2, writer1);
-
-    tokio::pin!(pipe1, pipe2);
-
-    tokio::select! {
-        res = pipe1 => res,
-        res = pipe2 => res
-    }
 }
 
 #[instrument]
