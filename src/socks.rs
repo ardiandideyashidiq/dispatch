@@ -8,6 +8,7 @@ use std::{
 
 use color_eyre::Section;
 use eyre::{eyre, Report, Result, WrapErr};
+use owo_colors::OwoColorize;
 use socksv5::{
     v4::SocksV4Command,
     v5::{SocksV5Command, SocksV5Handshake},
@@ -124,7 +125,7 @@ where
         }
     }
 
-    pub async fn handshake(&mut self) -> Result<TcpStream> {
+    pub async fn handshake(&mut self) -> Result<(TcpStream, TargetAddress, String)> {
         match socksv5::read_version(&mut self.reader).await {
             Err(err) => Err(self.handle_version_error(err).await),
             Ok(version) => self.handle_handshake_with_version(version).await,
@@ -160,31 +161,40 @@ where
     }
 
     #[instrument]
-    async fn handle_handshake_with_version(&mut self, version: SocksVersion) -> Result<TcpStream> {
+    async fn handle_handshake_with_version(
+        &mut self,
+        version: SocksVersion,
+    ) -> Result<(TcpStream, TargetAddress, String)> {
         match version {
             socksv5::SocksVersion::V5 => {
                 let handshake = socksv5::v5::read_handshake_skip_version(&mut self.reader).await?;
 
                 self.handle_auth(&handshake).await?;
 
-                let host = self.handle_request_v5().await?;
+                let (host, dest_display) = self.handle_request_v5().await?;
 
                 let target = self
                     .dispatcher
                     .dispatch(&host)
                     .wrap_err_with(dispatch_error)?;
 
-                self.handle_connect_v5(host, target).await
+                let stream = self
+                    .handle_connect_v5(host, target.clone(), &dest_display)
+                    .await?;
+                Ok((stream, target, dest_display))
             }
             socksv5::SocksVersion::V4 => {
-                let host = self.handle_request_v4().await?;
+                let (host, dest_display) = self.handle_request_v4().await?;
 
                 let target = self
                     .dispatcher
                     .dispatch(&host)
                     .wrap_err_with(dispatch_error)?;
 
-                self.handle_connect_v4(host, target).await
+                let stream = self
+                    .handle_connect_v4(host, target.clone(), &dest_display)
+                    .await?;
+                Ok((stream, target, dest_display))
             }
         }
     }
@@ -200,23 +210,32 @@ where
     }
 
     #[instrument]
-    async fn handle_request_v5(&mut self) -> Result<SocketAddr> {
+    async fn handle_request_v5(&mut self) -> Result<(SocketAddr, String)> {
         let request = socksv5::v5::read_request(&mut self.reader).await?;
 
         match request.command {
             socksv5::v5::SocksV5Command::Connect => {
-                let host = match request.host {
+                let (host, dest_display) = match request.host {
                     socksv5::v5::SocksV5Host::Ipv4(ip) => {
-                        SocketAddr::new(IpAddr::V4(ip.into()), request.port)
+                        let addr = SocketAddr::new(IpAddr::V4(ip.into()), request.port);
+                        (addr, addr.to_string())
                     }
                     socksv5::v5::SocksV5Host::Ipv6(ip) => {
-                        SocketAddr::new(IpAddr::V6(ip.into()), request.port)
+                        let addr = SocketAddr::new(IpAddr::V6(ip.into()), request.port);
+                        (addr, addr.to_string())
                     }
                     socksv5::v5::SocksV5Host::Domain(domain) => {
                         let domain = String::from_utf8(domain)?;
+                        let dest_display = format!("{}:{}", domain, request.port);
                         let mut addr = match lookup(domain.as_str(), request.port).await {
                             Ok(addr) => addr,
                             Err(err) => {
+                                eprintln!(
+                                    "{} DNS resolution failed for {}: {}",
+                                    "[-]".red().bold(),
+                                    domain,
+                                    err
+                                );
                                 socksv5::v5::write_request_status(
                                     &mut self.writer,
                                     socksv5::v5::SocksV5RequestStatus::HostUnreachable,
@@ -228,11 +247,11 @@ where
                             }
                         };
                         addr.set_port(request.port);
-                        addr
+                        (addr, dest_display)
                     }
                 };
 
-                Ok(host)
+                Ok((host, dest_display))
             }
             cmd => {
                 socksv5::v5::write_request_status(
@@ -252,6 +271,7 @@ where
         &mut self,
         address: SocketAddr,
         target: TargetAddress,
+        dest_display: &str,
     ) -> Result<TcpStream> {
         let server_socket = try_bind_socket(&target)?;
 
@@ -269,6 +289,17 @@ where
                 Ok(server_stream)
             }
             Err(err) => {
+                let iface_display = match &target.interface {
+                    Some(name) => format!("{name} ({})", target.ip),
+                    None => format!("{}", target.ip),
+                };
+                eprintln!(
+                    "{} Failed to connect to {} via {}: {}",
+                    "[-]".red().bold(),
+                    dest_display,
+                    iface_display.cyan(),
+                    err
+                );
                 // Unix error codes.
                 // TODO: handle Windows error codes.
                 let status = match err.raw_os_error() {
@@ -296,20 +327,27 @@ where
     }
 
     #[instrument]
-    async fn handle_request_v4(&mut self) -> Result<SocketAddr> {
+    async fn handle_request_v4(&mut self) -> Result<(SocketAddr, String)> {
         let request = socksv5::v4::read_request_skip_version(&mut self.reader).await?;
 
         match request.command {
-            socksv5::v4::SocksV4Command::Connect => Ok(match request.host {
+            socksv5::v4::SocksV4Command::Connect => match request.host {
                 socksv5::v4::SocksV4Host::Ip(ip) => {
-                    SocketAddr::new(IpAddr::V4(ip.into()), request.port)
+                    let addr = SocketAddr::new(IpAddr::V4(ip.into()), request.port);
+                    Ok((addr, addr.to_string()))
                 }
                 socksv5::v4::SocksV4Host::Domain(domain) => {
                     let domain = String::from_utf8(domain)?;
-
+                    let dest_display = format!("{}:{}", domain, request.port);
                     match lookup(domain.as_str(), request.port).await {
-                        Ok(addr) => addr,
+                        Ok(addr) => Ok((addr, dest_display)),
                         Err(err) => {
+                            eprintln!(
+                                "{} DNS resolution failed for {}: {}",
+                                "[-]".red().bold(),
+                                domain,
+                                err
+                            );
                             socksv5::v4::write_request_status(
                                 &mut self.writer,
                                 socksv5::v4::SocksV4RequestStatus::Failed,
@@ -317,11 +355,11 @@ where
                                 0,
                             )
                             .await?;
-                            return Err(err);
+                            Err(err)
                         }
                     }
                 }
-            }),
+            },
             cmd => {
                 socksv5::v4::write_request_status(
                     &mut self.writer,
@@ -340,6 +378,7 @@ where
         &mut self,
         address: SocketAddr,
         target: TargetAddress,
+        dest_display: &str,
     ) -> Result<TcpStream> {
         let server_socket = try_bind_socket(&target)?;
 
@@ -357,6 +396,17 @@ where
                 Ok(server_stream)
             }
             Err(err) => {
+                let iface_display = match &target.interface {
+                    Some(name) => format!("{name} ({})", target.ip),
+                    None => format!("{}", target.ip),
+                };
+                eprintln!(
+                    "{} Failed to connect to {} via {}: {}",
+                    "[-]".red().bold(),
+                    dest_display,
+                    iface_display.cyan(),
+                    err
+                );
                 socksv5::v4::write_request_status(
                     &mut self.writer,
                     socksv5::v4::SocksV4RequestStatus::Failed,

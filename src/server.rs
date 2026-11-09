@@ -20,7 +20,7 @@ async fn handle_socket<D>(mut socket: TcpStream, dispatcher: D) -> Result<()>
 where
     D: Dispatch + Debug,
 {
-    let mut server_socket = {
+    let (mut server_socket, target, dest_display) = {
         let (client_reader, client_writer) = socket.split();
 
         let mut handshake = SocksHandshake::new(client_reader, client_writer, dispatcher);
@@ -31,7 +31,7 @@ where
                     "An error occurred during the proxy handshake procedure"
                 )));
             }
-            Ok(server_socket) => server_socket,
+            Ok(result) => result,
         }
     };
 
@@ -44,13 +44,26 @@ where
             _ => return Err(err.into()),
         },
     };
-    let remote_addr = server_socket.peer_addr()?;
-    tracing::info!(
-        "connection initiated between {} and {}",
+
+    let iface_display = match &target.interface {
+        Some(name) => format!("{name} ({})", target.ip),
+        None => format!("{}", target.ip),
+    };
+
+    println!(
+        "{} {} -> {} via {}",
+        "[+]".green().bold(),
         local_addr,
-        remote_addr
+        dest_display.bold(),
+        iface_display.cyan()
     );
 
+    tracing::info!(
+        "connection initiated between {} and {} via {}",
+        local_addr,
+        dest_display,
+        iface_display
+    );
     if let Err(err) = tokio::io::copy_bidirectional_with_sizes(
         &mut socket,
         &mut server_socket,
@@ -63,7 +76,7 @@ where
             tracing::warn!(
                 "connection error between {} and {}: {}",
                 local_addr,
-                remote_addr,
+                dest_display,
                 err
             );
         }
@@ -72,7 +85,7 @@ where
     tracing::info!(
         "connection terminated between {} and {}",
         local_addr,
-        remote_addr
+        dest_display
     );
 
     Ok(())
