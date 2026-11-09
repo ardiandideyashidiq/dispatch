@@ -4,13 +4,15 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     num::NonZeroUsize,
     str::FromStr,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
 use color_eyre::Help;
 use eyre::{Context, Result};
 use network_interface::NetworkInterfaceConfig;
-use tokio::sync::Mutex;
 use tracing::instrument;
 
 use crate::net::{can_reach_internet, get_valid_addresses, is_virtual_or_vpn};
@@ -297,152 +299,131 @@ impl Display for WeightedAddress {
         Ok(())
     }
 }
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TargetAddress {
     pub ip: IpAddr,
     pub interface: Option<String>,
 }
 
-#[derive(Clone, Debug)]
-pub struct WeightedTarget {
-    pub ip: IpAddr,
-    pub interface: Option<String>,
-    pub weight: NonZeroUsize,
+#[derive(Debug, Clone)]
+pub struct WeightedRoundRobinDispatcher {
+    ipv4_schedule: Arc<[TargetAddress]>,
+    ipv4_cursor: Arc<AtomicUsize>,
+    ipv6_schedule: Arc<[TargetAddress]>,
+    ipv6_cursor: Arc<AtomicUsize>,
 }
 
-#[derive(Debug)]
-struct WeightedRoundRobinDispatcherInner {
-    ipv4: State,
-    ipv6: State,
-}
-
-#[derive(Debug)]
-struct State {
-    ips: Vec<WeightedTarget>,
-    ip_idx: usize,
-    count: usize,
-}
-
-impl WeightedRoundRobinDispatcherInner {
-    fn new(addresses: Vec<WeightedAddress>) -> WeightedRoundRobinDispatcherInner {
+impl WeightedRoundRobinDispatcher {
+    pub fn new(addresses: Vec<WeightedAddress>) -> WeightedRoundRobinDispatcher {
         debug_assert!(
             !addresses.is_empty(),
             "dispatcher should have at least one address"
         );
 
-        let mut ipv4s = vec![];
-        let mut ipv6s = vec![];
+        let mut ipv4_schedule = Vec::new();
+        let mut ipv6_schedule = Vec::new();
 
         for address in addresses {
             match address.interface {
                 Interface::Named { name, ipv4, ipv6 } => {
                     if let Some(ipv4) = ipv4 {
-                        ipv4s.push(WeightedTarget {
+                        let target = TargetAddress {
                             ip: IpAddr::V4(ipv4),
                             interface: Some(name.clone()),
-                            weight: address.weight,
-                        });
+                        };
+                        for _ in 0..usize::from(address.weight) {
+                            ipv4_schedule.push(target.clone());
+                        }
                     }
                     if let Some(ipv6) = ipv6 {
-                        ipv6s.push(WeightedTarget {
+                        let target = TargetAddress {
                             ip: IpAddr::V6(ipv6),
                             interface: Some(name.clone()),
-                            weight: address.weight,
-                        });
+                        };
+                        for _ in 0..usize::from(address.weight) {
+                            ipv6_schedule.push(target.clone());
+                        }
                     }
                 }
                 Interface::Ip(ip) => match ip {
-                    IpAddr::V4(v4) => ipv4s.push(WeightedTarget {
-                        ip: IpAddr::V4(v4),
-                        interface: None,
-                        weight: address.weight,
-                    }),
-                    IpAddr::V6(v6) => ipv6s.push(WeightedTarget {
-                        ip: IpAddr::V6(v6),
-                        interface: None,
-                        weight: address.weight,
-                    }),
+                    IpAddr::V4(v4) => {
+                        let target = TargetAddress {
+                            ip: IpAddr::V4(v4),
+                            interface: None,
+                        };
+                        for _ in 0..usize::from(address.weight) {
+                            ipv4_schedule.push(target.clone());
+                        }
+                    }
+                    IpAddr::V6(v6) => {
+                        let target = TargetAddress {
+                            ip: IpAddr::V6(v6),
+                            interface: None,
+                        };
+                        for _ in 0..usize::from(address.weight) {
+                            ipv6_schedule.push(target.clone());
+                        }
+                    }
                 },
             }
         }
 
-        WeightedRoundRobinDispatcherInner {
-            ipv4: State {
-                ips: ipv4s,
-                ip_idx: 0,
-                count: 0,
-            },
-            ipv6: State {
-                ips: ipv6s,
-                ip_idx: 0,
-                count: 0,
-            },
+        WeightedRoundRobinDispatcher {
+            ipv4_schedule: ipv4_schedule.into(),
+            ipv4_cursor: Arc::new(AtomicUsize::new(0)),
+            ipv6_schedule: ipv6_schedule.into(),
+            ipv6_cursor: Arc::new(AtomicUsize::new(0)),
         }
-    }
-
-    fn dispatch(&mut self, remote_addr: &SocketAddr) -> Result<TargetAddress> {
-        let state = self.select_state(remote_addr)?;
-
-        let ip = &state.ips[state.ip_idx];
-
-        state.count += 1;
-        if state.count == usize::from(ip.weight) {
-            state.count = 0;
-            state.ip_idx = (state.ip_idx + 1) % state.ips.len();
-        }
-
-        Ok(TargetAddress {
-            ip: ip.ip,
-            interface: ip.interface.clone(),
-        })
-    }
-
-    fn select_state(&mut self, remote_addr: &SocketAddr) -> Result<&mut State> {
-        let state = match remote_addr.ip() {
-            IpAddr::V4(_) => &mut self.ipv4,
-            IpAddr::V6(_) => &mut self.ipv6,
-        };
-
-        if state.ips.is_empty() {
-            return Err(eyre::eyre!(
-                "Address type mismatch: no configured local address or interface can connect to \
-                remote address `{}` ({}) because the address types are incompatible",
-                remote_addr,
-                addr_type(remote_addr.ip())
-            )
-            .suggestion(format!(
-                "Please ensure that the local addresses or network interfaces you have \
-                configured support {}",
-                addr_type(remote_addr.ip())
-            ))
-            .suggestion(
-                "As a last resort, you can try to disable IPv6 support in the settings of your main \
-                network interface to force your OS to use IPv4 everywhere",
-            ));
-        }
-
-        Ok(state)
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct WeightedRoundRobinDispatcher(Arc<Mutex<WeightedRoundRobinDispatcherInner>>);
-
-impl WeightedRoundRobinDispatcher {
-    pub fn new(addresses: Vec<WeightedAddress>) -> WeightedRoundRobinDispatcher {
-        WeightedRoundRobinDispatcher(Arc::new(Mutex::new(
-            WeightedRoundRobinDispatcherInner::new(addresses),
-        )))
-    }
-}
-
-#[async_trait::async_trait]
 impl Dispatch for WeightedRoundRobinDispatcher {
     #[instrument]
-    async fn dispatch(&self, remote_addr: &SocketAddr) -> Result<TargetAddress> {
-        let mut dispatcher = self.0.lock().await;
-        dispatcher.dispatch(remote_addr)
+    fn dispatch(&self, remote_addr: &SocketAddr) -> Result<TargetAddress> {
+        match remote_addr.ip() {
+            IpAddr::V4(_) => {
+                if self.ipv4_schedule.is_empty() {
+                    return Err(eyre::eyre!(
+                        "Address type mismatch: no configured local address or interface can connect to \
+                        remote address `{}` ({}) because the address types are incompatible",
+                        remote_addr,
+                        addr_type(remote_addr.ip())
+                    )
+                    .suggestion(format!(
+                        "Please ensure that the local addresses or network interfaces you have \
+                        configured support {}",
+                        addr_type(remote_addr.ip())
+                    ))
+                    .suggestion(
+                        "As a last resort, you can try to disable IPv6 support in the settings of your main \
+                        network interface to force your OS to use IPv4 everywhere",
+                    ));
+                }
+                let idx = self.ipv4_cursor.fetch_add(1, Ordering::Relaxed) % self.ipv4_schedule.len();
+                Ok(self.ipv4_schedule[idx].clone())
+            }
+            IpAddr::V6(_) => {
+                if self.ipv6_schedule.is_empty() {
+                    return Err(eyre::eyre!(
+                        "Address type mismatch: no configured local address or interface can connect to \
+                        remote address `{}` ({}) because the address types are incompatible",
+                        remote_addr,
+                        addr_type(remote_addr.ip())
+                    )
+                    .suggestion(format!(
+                        "Please ensure that the local addresses or network interfaces you have \
+                        configured support {}",
+                        addr_type(remote_addr.ip())
+                    ))
+                    .suggestion(
+                        "As a last resort, you can try to disable IPv6 support in the settings of your main \
+                        network interface to force your OS to use IPv4 everywhere",
+                    ));
+                }
+                let idx = self.ipv6_cursor.fetch_add(1, Ordering::Relaxed) % self.ipv6_schedule.len();
+                Ok(self.ipv6_schedule[idx].clone())
+            }
+        }
     }
 }
 
@@ -450,5 +431,53 @@ fn addr_type(addr: IpAddr) -> &'static str {
     match addr {
         IpAddr::V4(_) => "IPv4",
         IpAddr::V6(_) => "IPv6",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lock_free_wrr_distribution() {
+        let ip1 = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
+        let ip2 = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20));
+        let addresses = vec![
+            WeightedAddress {
+                interface: Interface::Named {
+                    name: "eth0".into(),
+                    ipv4: Some(Ipv4Addr::new(192, 168, 1, 10)),
+                    ipv6: None,
+                },
+                weight: NonZeroUsize::new(3).unwrap(),
+            },
+            WeightedAddress {
+                interface: Interface::Named {
+                    name: "wlan0".into(),
+                    ipv4: Some(Ipv4Addr::new(192, 168, 1, 20)),
+                    ipv6: None,
+                },
+                weight: NonZeroUsize::new(1).unwrap(),
+            },
+        ];
+
+        let dispatcher = WeightedRoundRobinDispatcher::new(addresses);
+        let remote: SocketAddr = "1.1.1.1:80".parse().unwrap();
+
+        let mut c1 = 0;
+        let mut c2 = 0;
+        for _ in 0..400 {
+            let target = dispatcher.dispatch(&remote).unwrap();
+            if target.ip == ip1 {
+                assert_eq!(target.interface.as_deref(), Some("eth0"));
+                c1 += 1;
+            } else if target.ip == ip2 {
+                assert_eq!(target.interface.as_deref(), Some("wlan0"));
+                c2 += 1;
+            }
+        }
+
+        assert_eq!(c1, 300);
+        assert_eq!(c2, 100);
     }
 }

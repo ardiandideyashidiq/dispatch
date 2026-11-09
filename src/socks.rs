@@ -133,7 +133,6 @@ where
                 let target = self
                     .dispatcher
                     .dispatch(&host)
-                    .await
                     .wrap_err_with(dispatch_error)?;
 
                 self.handle_connect_v5(host, target).await
@@ -144,7 +143,6 @@ where
                 let target = self
                     .dispatcher
                     .dispatch(&host)
-                    .await
                     .wrap_err_with(dispatch_error)?;
 
                 self.handle_connect_v4(host, target).await
