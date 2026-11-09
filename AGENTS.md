@@ -32,8 +32,8 @@
 │  │  6. connect to target remote address -> TcpStream                                │  │
 │  └──────────────────────────────────┬───────────────────────────────────────────────┘  │
 │                                     ▼                                                  │
-│  pipe_multiple() (src/server.rs)                                                       │
-│   tokio::select! over bidirectional tokio::io::copy() routines                         │
+│  tokio::io::copy_bidirectional_with_sizes (src/server.rs)                               │
+│   64KB buffer bidirectional piping with TCP half-close coordination                   │
 └─────────────────────────────────────┬──────────────────────────────────────────────────┘
                                       │ Bound Outbound Interface (e.g. eth0, wlan0)
                                       ▼
@@ -48,9 +48,8 @@
 3. **Interface Enumeration**: `src/list.rs` queries OS interfaces via `network-interface` and prints a CLI table.
 4. **Address Resolution**: `src/dispatcher/weighted_rr.rs` parses `<interface_or_ip>[/<weight>]` syntax and maps names to bindable non-loopback IPs.
 5. **Connection Acceptance**: `src/server.rs` binds `tokio::net::TcpListener`, accepts connections, and spawns isolated tasks.
-6. **SOCKS Negotiation**: `src/socks.rs` decodes SOCKSv4/SOCKSv5 protocols via `socksv5`, resolves DNS names asynchronously, and binds an outbound `tokio::net::TcpSocket` (in `src/net.rs`) to the local IP chosen by `WeightedRoundRobinDispatcher`.
-7. **Bidirectional Tunneling**: `pipe_multiple` in `src/server.rs` splits both sockets into reader/writer halves and tunnels data concurrently via `tokio::select!`.
-
+6. **SOCKS Negotiation & DNS Caching**: `src/socks.rs` decodes SOCKSv4/SOCKSv5 protocols via `socksv5`, queries an in-memory TTL `DnsCache` (falling back to asynchronous DNS lookup), and binds an outbound `tokio::net::TcpSocket` (in `src/net.rs`) to the local IP and device interface chosen by `WeightedRoundRobinDispatcher`.
+7. **Bidirectional Tunneling**: `src/server.rs` tunnels client and server data concurrently via `tokio::io::copy_bidirectional_with_sizes` using 64KB buffers.
 ---
 
 ## Key Directories
@@ -111,15 +110,14 @@ cargo run -- -d start --ip 127.0.0.1 --port 1080 192.168.1.10/2 192.168.1.11/1
 - Panic messages are captured by `DispatchPanicMessage` in `src/debug.rs`, outputting platform metadata and formatted terminal error reports.
 - Non-debug runs redirect logs asynchronously to a platform-specific data directory via `tracing_appender::non_blocking`.
 
-### Asynchronous State & Trait Design
-- Dispatch algorithms implement the asynchronous trait `Dispatch` (`#[async_trait::async_trait] pub trait Dispatch` in `src/dispatcher/mod.rs`).
-- Shared state across Tokio tasks is wrapped in `Arc<tokio::sync::Mutex<...>>`.
-- Stream handling relies on `tokio::pin!` and `tokio::select!` for clean cancellation when either stream half disconnects.
+### Concurrency & Trait Design
+- Dispatch algorithms implement `pub trait Dispatch` returning `Result<TargetAddress>` synchronously without async Mutex locks or `#[async_trait]` boxed future allocations.
+- `WeightedRoundRobinDispatcher` uses pre-expanded immutable schedule slices indexed by wait-free `AtomicUsize` cursors (`Relaxed` ordering), keeping IPv4 and IPv6 cursors decoupled.
+- Stream forwarding uses `tokio::io::copy_bidirectional_with_sizes(65536, 65536)` for high throughput and proper TCP half-close handling.
 
-### Socket Configuration
-- Outbound sockets created in `src/net.rs` explicitly enable `set_reuseaddr(true)` before binding to port `0` on the designated local `IpAddr`.
+### Socket Configuration & Device Binding
+- Outbound sockets created in `src/net.rs` enable `set_reuseaddr(true)` and bind to device names (`SO_BINDTODEVICE` on Linux, `IP_BOUND_IF` on macOS) so traffic reliably exits through the designated physical network adapter.
 - Filter out loopback (`is_loopback()`) and IPv4/IPv6 link-local addresses when resolving usable network interfaces.
-
 ---
 
 ## Important Files
