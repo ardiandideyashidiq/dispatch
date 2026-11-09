@@ -1,6 +1,9 @@
 use std::{
+    collections::HashMap,
     fmt::Debug,
     net::{IpAddr, SocketAddr},
+    sync::{LazyLock, RwLock},
+    time::{Duration, Instant},
 };
 
 use color_eyre::Section;
@@ -12,7 +15,7 @@ use socksv5::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite},
-    net::{lookup_host, TcpSocket, TcpStream, ToSocketAddrs},
+    net::{lookup_host, TcpSocket, TcpStream},
 };
 use tracing::instrument;
 
@@ -46,16 +49,52 @@ fn try_bind_socket(target: &TargetAddress) -> Result<TcpSocket> {
     })
 }
 
+#[derive(Debug)]
+pub struct DnsCache {
+    entries: RwLock<HashMap<(String, u16), (SocketAddr, Instant)>>,
+    ttl: Duration,
+}
+
+impl DnsCache {
+    pub fn new() -> Self {
+        Self {
+            entries: RwLock::new(HashMap::new()),
+            ttl: Duration::from_secs(60),
+        }
+    }
+
+    pub fn get(&self, domain: &str, port: u16) -> Option<SocketAddr> {
+        let entries = self.entries.read().ok()?;
+        let (addr, timestamp) = entries.get(&(domain.to_ascii_lowercase(), port))?;
+        if timestamp.elapsed() < self.ttl {
+            Some(*addr)
+        } else {
+            None
+        }
+    }
+
+    pub fn insert(&self, domain: &str, port: u16, addr: SocketAddr) {
+        if let Ok(mut entries) = self.entries.write() {
+            entries.insert((domain.to_ascii_lowercase(), port), (addr, Instant::now()));
+        }
+    }
+}
+
+static DNS_CACHE: LazyLock<DnsCache> = LazyLock::new(DnsCache::new);
+
 #[instrument]
-async fn lookup<T>(host: T) -> Result<SocketAddr>
-where
-    T: ToSocketAddrs + Debug,
-{
-    let addr = lookup_host(&host)
+async fn lookup(domain: &str, port: u16) -> Result<SocketAddr> {
+    if let Some(cached_addr) = DNS_CACHE.get(domain, port) {
+        return Ok(cached_addr);
+    }
+
+    let addr = lookup_host((domain, port))
         .await
-        .map_err(|err| eyre::eyre!(err).wrap_err(resolve_host_error(&host)))?
+        .map_err(|err| eyre::eyre!(err).wrap_err(resolve_host_error(&domain)))?
         .next()
-        .ok_or_else(|| resolve_host_error(&host))?;
+        .ok_or_else(|| resolve_host_error(&domain))?;
+
+    DNS_CACHE.insert(domain, port, addr);
     Ok(addr)
 }
 
@@ -175,7 +214,7 @@ where
                     }
                     socksv5::v5::SocksV5Host::Domain(domain) => {
                         let domain = String::from_utf8(domain)?;
-                        let mut addr = match lookup((domain.as_str(), request.port)).await {
+                        let mut addr = match lookup(domain.as_str(), request.port).await {
                             Ok(addr) => addr,
                             Err(err) => {
                                 socksv5::v5::write_request_status(
@@ -268,7 +307,7 @@ where
                 socksv5::v4::SocksV4Host::Domain(domain) => {
                     let domain = String::from_utf8(domain)?;
 
-                    match lookup((domain.as_str(), request.port)).await {
+                    match lookup(domain.as_str(), request.port).await {
                         Ok(addr) => addr,
                         Err(err) => {
                             socksv5::v4::write_request_status(
@@ -388,4 +427,27 @@ fn lookup_note() -> &'static str {
 fn safe_to_ignore_note() -> String {
     use owo_colors::OwoColorize;
     format!("{} {}", "It is safe to ignore in most cases.".bold(), "However, if you notice a degradation in service because of this error, please file an issue.")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dns_cache_hit_and_expiration() {
+        let mut cache = DnsCache::new();
+        cache.ttl = Duration::from_millis(50);
+
+        let addr: SocketAddr = "1.1.1.1:80".parse().unwrap();
+        assert_eq!(cache.get("example.com", 80), None);
+
+        cache.insert("EXAMPLE.com", 80, addr);
+        // Case-insensitive lookup hit
+        assert_eq!(cache.get("example.com", 80), Some(addr));
+        assert_eq!(cache.get("different.com", 80), None);
+
+        std::thread::sleep(Duration::from_millis(60));
+        // Expired after TTL
+        assert_eq!(cache.get("example.com", 80), None);
+    }
 }
