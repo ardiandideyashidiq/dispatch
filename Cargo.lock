@@ -263,6 +263,7 @@ dependencies = [
  "color-eyre",
  "directories",
  "eyre",
+ "libc",
  "network-interface",
  "owo-colors 4.2.0",
  "percent-encoding",
