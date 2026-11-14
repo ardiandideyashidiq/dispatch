@@ -3,7 +3,7 @@ use std::{
     net::{IpAddr, SocketAddr},
 };
 
-use color_eyre::owo_colors::OwoColorize;
+use color_eyre::{owo_colors::OwoColorize, Help};
 use eyre::Result;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::instrument;
@@ -97,8 +97,25 @@ async fn start_server(
     addresses: Vec<WeightedAddress>,
     auto_discovered: bool,
 ) -> Result<()> {
-    let listener = TcpListener::bind(addr).await?;
-
+    let listener = match TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+            return Err(eyre::eyre!(
+                "Cannot bind proxy to `{}`: port {} is already in use by another process.",
+                addr,
+                addr.port()
+            )
+            .suggestion(format!(
+                "Try specifying a different port using `--port <PORT>` (e.g. `dispatch start --port {}`), \
+                or stop the process currently using port {}.",
+                addr.port() + 1,
+                addr.port()
+            )));
+        }
+        Err(err) => {
+            return Err(eyre::eyre!("Failed to bind proxy to `{}`: {}", addr, err));
+        }
+    };
     if auto_discovered {
         println!(
             "Auto-discovered {} usable {}: {}",

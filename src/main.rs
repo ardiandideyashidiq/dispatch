@@ -51,14 +51,24 @@ fn main() -> Result<()> {
         LogStrategy::File
     })?;
 
-    match opt.command {
-        Command::List => list::list(),
+    let res = match opt.command {
+        Command::List => {
+            list::list();
+            Ok(())
+        }
         Command::Start {
             ip,
             port,
             addresses,
-        } => {
-            server::server(ip, port, addresses)?
+        } => server::server(ip, port, addresses),
+    };
+
+    if let Err(err) = res {
+        if opt.debug {
+            return Err(err);
+        } else {
+            eprintln!("{err:?}");
+            std::process::exit(1);
         }
     }
 

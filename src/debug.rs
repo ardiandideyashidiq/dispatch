@@ -105,11 +105,9 @@ pub enum LogStrategy {
 }
 
 pub fn install(log_strategy: LogStrategy) -> Result<Option<WorkerGuard>> {
-    std::env::set_var("RUST_LIB_BACKTRACE", "full");
-
     let shared_log_path = Arc::new(Mutex::new(None));
 
-    color_eyre::config::HookBuilder::default()
+    let mut hook_builder = color_eyre::config::HookBuilder::default()
         .issue_url(concat!(env!("CARGO_PKG_REPOSITORY"), "/issues/new"))
         .add_issue_metadata("Version", env!("CARGO_PKG_VERSION"))
         .add_issue_metadata(
@@ -121,9 +119,16 @@ pub fn install(log_strategy: LogStrategy) -> Result<Option<WorkerGuard>> {
             log_path: Arc::clone(&shared_log_path),
         })
         .display_env_section(false)
-        .theme(color_eyre::config::Theme::new())
-        .install()?;
+        .theme(color_eyre::config::Theme::new());
 
+    if matches!(log_strategy, LogStrategy::Stdout) {
+        std::env::set_var("RUST_LIB_BACKTRACE", "full");
+        hook_builder = hook_builder.capture_span_trace_by_default(true);
+    } else {
+        hook_builder = hook_builder.capture_span_trace_by_default(false);
+    }
+
+    hook_builder.install()?;
     match log_strategy {
         LogStrategy::File => match get_file_writer() {
             Ok((log_path, file_appender, guard)) => {
